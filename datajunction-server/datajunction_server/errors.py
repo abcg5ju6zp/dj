@@ -350,6 +350,29 @@ class DJQueryServiceClientEntityNotFound(DJException):
     http_status_code: int = 404
 
 
+class DJBackfillScheduleUncertainException(DJQueryServiceClientException):
+    """
+    Raised when a backfill scheduling call timed out or lost its connection
+    before the query service could answer.
+
+    The workflow may already exist in that case, so callers must query the
+    original workflow before deciding whether to resubmit -- never retry the
+    submission blindly, or a second workflow gets launched.
+    """
+
+    http_status_code: int = 504
+
+
+class DJBackfillConflictException(DJException):
+    """
+    Raised when a backfill operation conflicts with the current materialization
+    generation: either an overlapping run is already active for the same
+    generation, or the run belongs to a definition that has since been updated.
+    """
+
+    http_status_code: int = HTTPStatus.CONFLICT
+
+
 class DJActionNotAllowedException(DJException):
     """
     Exception raised when an action is not allowed.

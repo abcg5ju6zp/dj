@@ -52,6 +52,7 @@ from datajunction_server.models.materialization import (
 from datajunction_server.models.metric import TranslatedSQL
 from datajunction_server.models.node_type import NodeType
 from datajunction_server.models.partition import (
+    BackfillStatus,
     PartitionBackfill,
     parse_partition_value,
 )
@@ -1001,6 +1002,10 @@ async def record_backfill(
                 ).model_dump(),
             ],
             urls=[url] if url else [],
+            # Coverage backfills stay fire-and-forget: the workflow posts its
+            # own availability, so the row is a record of the launch rather
+            # than a generation-tracked run awaiting recovery.
+            status=BackfillStatus.COMPLETE.value,
         ),
     )
     await session.commit()

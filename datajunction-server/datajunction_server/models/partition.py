@@ -3,7 +3,7 @@
 import re
 from datetime import date, datetime
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
 
 from datajunction_server.enum import StrEnum
@@ -99,6 +99,140 @@ class BackfillOutput(BaseModel):
 
     spec: list[PartitionBackfill] | None = None
     urls: list[str] | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BackfillStatus(StrEnum):
+    """
+    Lifecycle of a generation-tracked backfill run.
+
+    PENDING: the run was recorded but the external workflow's scheduling
+    response was never confirmed (lost response, timeout or crash).
+    RUNNING: the workflow was accepted and not every planned partition is
+    accounted for yet.
+    PARTIALLY_COMPLETE: the workflow is done but at least one planned partition
+    failed; availability is published for the confirmed partitions only.
+    COMPLETE: every planned partition was confirmed and published.
+    FAILED: scheduling was rejected outright (e.g. the backfill workflow does
+    not exist); nothing was launched.
+    SUPERSEDED: a backfill of a newer materialization generation took over the
+    overlapping range; this run must no longer publish anything.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    PARTIALLY_COMPLETE = "partially_complete"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    SUPERSEDED = "superseded"
+
+    @property
+    def is_active(self) -> bool:
+        """Whether a run in this state may still make progress or be retried."""
+        return self in (
+            BackfillStatus.PENDING,
+            BackfillStatus.RUNNING,
+            BackfillStatus.PARTIALLY_COMPLETE,
+        )
+
+
+class WorkflowRunState(StrEnum):
+    """
+    State of an external workflow run, as reported by the workflow service.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the workflow has stopped."""
+        return self in (
+            WorkflowRunState.SUCCEEDED,
+            WorkflowRunState.FAILED,
+            WorkflowRunState.CANCELLED,
+        )
+
+
+class WorkflowStatusInfo(BaseModel):
+    """
+    Status of an external workflow run, used to reconcile a backfill after a
+    lost scheduling response or a service restart.
+    """
+
+    workflow_name: str
+    state: WorkflowRunState = WorkflowRunState.UNKNOWN
+    urls: list[str] = Field(default_factory=list)
+    output_tables: list[str] = Field(default_factory=list)
+    # Concrete partition coordinates (same keys as ``Backfill.planned_partitions``)
+    completed_partitions: list[str] = Field(default_factory=list)
+    failed_partitions: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class BackfillPartitionCompletion(BaseModel):
+    """
+    Outcome of one concrete planned partition.
+
+    ``values`` is the partition coordinate the workflow ran for, e.g.
+    ``["20230101"]`` for a single temporal partition or
+    ``["US", "20230101"]`` for a categorical + temporal one. The catalog /
+    schema / table identify the output the partition was written to and are
+    only required with the first confirmed partition of a run that has no
+    output table pinned yet.
+    """
+
+    values: list[str]
+    succeeded: bool = True
+    catalog: str | None = None
+    schema_: str | None = Field(default=None, alias="schema")
+    table: str | None = None
+    url: str | None = None
+    valid_through_ts: int | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class BackfillCompletionInput(BaseModel):
+    """
+    Partition-level confirmations posted by the external workflow.
+
+    Availability is published for exactly the confirmed partitions reported
+    here; a run that reports a failure must never publish a state covering the
+    whole requested range.
+    """
+
+    partitions: list[BackfillPartitionCompletion]
+
+
+class BackfillStatusInfo(BaseModel):
+    """
+    Status of a generation-tracked backfill run.
+    """
+
+    id: int
+    materialization_id: int
+    materialization_name: str
+    node_name: str
+    node_version: str
+    generation: int
+    status: BackfillStatus
+    workflow_name: str | None = None
+    idempotency_key: str | None = None
+    temporal_range: list[str] | None = None
+    spec: list[PartitionBackfill] = Field(default_factory=list)
+    planned_partitions: list[str] = Field(default_factory=list)
+    confirmed_partitions: list[str] = Field(default_factory=list)
+    failed_partitions: list[str] = Field(default_factory=list)
+    published_partitions: list[str] = Field(default_factory=list)
+    output_tables: list[str] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 

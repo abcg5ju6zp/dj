@@ -104,6 +104,17 @@ class Materialization(Base):
         default=None,
     )
 
+    # Monotonic definition generation. Bumped whenever the materialization's
+    # config or schedule changes in place; backfills pin the generation they
+    # were submitted against, so an older run can never confirm partitions or
+    # publish availability onto an updated definition.
+    generation: Mapped[int] = mapped_column(
+        sa.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+
     deactivated_at: Mapped[UTCDatetime] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

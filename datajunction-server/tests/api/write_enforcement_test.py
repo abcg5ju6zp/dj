@@ -143,6 +143,16 @@ CASES = [
 
 # Routes whose denial test lives in another module, next to the fixtures it needs.
 DENIAL_TESTED_ELSEWHERE: dict[tuple[str, str], str] = {
+    (
+        "POST",
+        "/nodes/{node_name}/materializations/{materialization_name}/backfills"
+        "/{backfill_id}/completions",
+    ): "backfills_test.py",
+    (
+        "POST",
+        "/nodes/{node_name}/materializations/{materialization_name}/backfills"
+        "/{backfill_id}/recover",
+    ): "backfills_test.py",
     ("POST", "/register/table/{catalog}/{schema_}/{table}"): "nodes_test.py",
     ("POST", "/preaggs/{preagg_id}/materialize"): "preaggregations_test.py",
     ("PATCH", "/preaggs/{preagg_id}/config"): "preaggregations_test.py",

@@ -15,7 +15,10 @@ from datajunction_server.models.materialization import (
     MaterializationInfo,
 )
 from datajunction_server.models.node_type import NodeType
-from datajunction_server.models.partition import PartitionBackfill
+from datajunction_server.models.partition import (
+    PartitionBackfill,
+    WorkflowStatusInfo,
+)
 from datajunction_server.models.preaggregation import PreAggMaterializationInput
 from datajunction_server.models.query import QueryCreate, QueryWithResults
 from datajunction_server.models.table_metadata import TableMetadata
@@ -286,6 +289,8 @@ class HttpQueryServiceClient(BaseQueryServiceClient):
         node_type: NodeType,
         materialization_name: str,
         partitions: list[PartitionBackfill],
+        workflow_name: str | None = None,
+        idempotency_key: str | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> MaterializationInfo:
         """Run backfill via HTTP query service."""
@@ -295,5 +300,18 @@ class HttpQueryServiceClient(BaseQueryServiceClient):
             node_type=node_type,
             materialization_name=materialization_name,
             partitions=partitions,
+            workflow_name=workflow_name,
+            idempotency_key=idempotency_key,
+            request_headers=request_headers,
+        )
+
+    def get_workflow_status(
+        self,
+        workflow_name: str,
+        request_headers: dict[str, str] | None = None,
+    ) -> WorkflowStatusInfo | None:
+        """Look an external workflow up by name via HTTP query service."""
+        return self._client.get_workflow_status(
+            workflow_name=workflow_name,
             request_headers=request_headers,
         )

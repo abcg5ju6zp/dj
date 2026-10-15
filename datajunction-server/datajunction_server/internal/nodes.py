@@ -1584,32 +1584,36 @@ async def update_node_with_query(
     await session.refresh(new_revision, ["materializations"])
     if active_materializations and new_revision.query != old_revision.query:
         for old in active_materializations:
-            new_revision.materializations.append(
-                await create_new_materialization(
-                    session,
-                    new_revision,
-                    UpsertMaterialization(  # type: ignore
-                        name=old.name,
-                        config=old.config,
-                        schedule=old.schedule,
+            new_materialization = await create_new_materialization(
+                session,
+                new_revision,
+                UpsertMaterialization(  # type: ignore
+                    name=old.name,
+                    config=old.config,
+                    schedule=old.schedule,
+                    strategy=old.strategy,
+                    job=MaterializationJobTypeEnum.find_match(old.job).value.name,
+                )
+                if old.job != MaterializationJobTypeEnum.DRUID_CUBE.value.job_class
+                else (
+                    UpsertCubeMaterialization(
+                        job=MaterializationJobTypeEnum.find_match(
+                            old.job,
+                        ).value.name,
                         strategy=old.strategy,
-                        job=MaterializationJobTypeEnum.find_match(old.job).value.name,
+                        schedule=old.schedule,
+                        lookback_window=old.lookback_window,
                     )
-                    if old.job != MaterializationJobTypeEnum.DRUID_CUBE.value.job_class
-                    else (
-                        UpsertCubeMaterialization(
-                            job=MaterializationJobTypeEnum.find_match(
-                                old.job,
-                            ).value.name,
-                            strategy=old.strategy,
-                            schedule=old.schedule,
-                            lookback_window=old.lookback_window,
-                        )
-                    ),
-                    access_checker,
-                    current_user=current_user,
                 ),
+                access_checker,
+                current_user=current_user,
             )
+            # Carry the definition lineage forward: the new revision's
+            # materialization strictly supersedes the old revision's, so its
+            # generation is one greater -- backfills pinned to the old row can
+            # never publish onto the new definition.
+            new_materialization.generation = (old.generation or 1) + 1
+            new_revision.materializations.append(new_materialization)
         background_tasks.add_task(
             schedule_materialization_jobs_bg,
             node_revision_id=node.current.id,  # type: ignore

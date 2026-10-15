@@ -7,7 +7,7 @@ import logging
 from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import httpx
 import requests
@@ -16,6 +16,7 @@ from urllib3 import Retry
 
 from datajunction_server.database.column import Column
 from datajunction_server.errors import (
+    DJBackfillScheduleUncertainException,
     DJDoesNotExistException,
     DJQueryServiceClientEntityNotFound,
     DJQueryServiceClientException,
@@ -30,7 +31,10 @@ from datajunction_server.models.materialization import (
     MaterializationInfo,
 )
 from datajunction_server.models.node_type import NodeType
-from datajunction_server.models.partition import PartitionBackfill
+from datajunction_server.models.partition import (
+    PartitionBackfill,
+    WorkflowStatusInfo,
+)
 from datajunction_server.models.query import QueryCreate, QueryWithResults
 from datajunction_server.models.table_metadata import TableMetadata, TableOwner
 from datajunction_server.sql.parsing.types import ColumnType
@@ -936,19 +940,63 @@ class QueryServiceClient:
         node_type: NodeType,
         materialization_name: str,
         partitions: list[PartitionBackfill],
+        workflow_name: str | None = None,
+        idempotency_key: str | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> MaterializationInfo:
-        """Kicks off a backfill with the given backfill spec"""
+        """
+        Kicks off a backfill with the given backfill spec.
+
+        When ``workflow_name`` / ``idempotency_key`` are supplied they are sent
+        along so the workflow service runs the pinned workflow and dedupes a
+        retried submission to the same run. Without them the request keeps the
+        legacy bare-partition-list shape for materializations that predate
+        workflow name recording.
+
+        A timeout or lost connection raises ``DJBackfillScheduleUncertainException``:
+        the workflow may have been created despite the missing answer, and the
+        caller must look the original workflow up before resubmitting. An
+        explicit rejection (for example, no backfill workflow exists) keeps the
+        historical contract of an empty ``MaterializationInfo``.
+        """
         backfill_endpoint = (
             f"/materialization/run/{node_name}/{materialization_name}"
             f"/?node_version={node_version}&node_type={node_type}"
         )
-        response = self.requests_session.post(
-            backfill_endpoint,
-            json=[partition.model_dump() for partition in partitions],
-            headers=self.requests_session.headers,
-            timeout=20,
-        )
+        payload: Any
+        if workflow_name is not None or idempotency_key is not None:
+            payload = {
+                "partitions": [partition.model_dump() for partition in partitions],
+                "workflow_name": workflow_name,
+                "idempotency_key": idempotency_key,
+            }
+        else:
+            payload = [partition.model_dump() for partition in partitions]
+        try:
+            response = self.requests_session.post(
+                backfill_endpoint,
+                json=payload,
+                headers=self.requests_session.headers,
+                timeout=20,
+            )
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ) as exc:
+            _logger.warning(
+                "[DJQS] Backfill scheduling for node=%s workflow=%s is uncertain "
+                "(%s); the original workflow must be queried before any retry",
+                node_name,
+                workflow_name,
+                str(exc),
+            )
+            raise DJBackfillScheduleUncertainException(
+                message=(
+                    f"Lost the scheduling response for backfill of node={node_name}"
+                    f" workflow={workflow_name}: {exc}. The workflow may already"
+                    " exist; query it before resubmitting."
+                ),
+            ) from exc
         if response.status_code not in (200, 201):
             _logger.exception(  # pragma: no cover
                 "[DJQS] Failed to run backfill for node=%s with `POST %s`",
@@ -958,8 +1006,46 @@ class QueryServiceClient:
             return MaterializationInfo(output_tables=[], urls=[])  # pragma: no cover
 
         _logger.info(
-            "[DJQS] Ran backfill for node=%s with `POST %s`",
+            "[DJQS] Ran backfill for node=%s workflow=%s with `POST %s`",
             node_name,
+            workflow_name,
             backfill_endpoint,
         )
         return MaterializationInfo(**response.json())
+
+    def get_workflow_status(
+        self,
+        workflow_name: str,
+        request_headers: dict[str, str] | None = None,
+    ) -> WorkflowStatusInfo | None:
+        """
+        Look an external workflow up by name.
+
+        Returns ``None`` when the workflow service has no such workflow (HTTP
+        404) -- the answer a scheduling-timeout reconciliation needs to decide
+        that resubmitting is safe. Any other failure raises.
+        """
+        status_endpoint = f"/workflows/{quote(workflow_name, safe='')}"
+        response = self.requests_session.get(
+            status_endpoint,
+            headers=self.requests_session.headers,
+            timeout=10,
+        )
+        if response.status_code == HTTPStatus.NOT_FOUND:
+            _logger.info(
+                "[DJQS] No workflow named `%s` exists (`GET %s` -> 404)",
+                workflow_name,
+                status_endpoint,
+            )
+            return None
+        if response.status_code not in (200, 201):
+            raise DJQueryServiceClientException(
+                message=(
+                    f"Error response from query service while looking up workflow"
+                    f" {workflow_name}: {response.text}"
+                ),
+                http_status_code=response.status_code,
+            )
+        payload = response.json()
+        payload.setdefault("workflow_name", workflow_name)
+        return WorkflowStatusInfo(**payload)

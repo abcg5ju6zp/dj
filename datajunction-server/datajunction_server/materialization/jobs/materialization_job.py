@@ -40,6 +40,8 @@ class MaterializationJob(abc.ABC):
         materialization: Materialization,
         partitions: list[PartitionBackfill],
         query_service_client: QueryServiceClient,
+        workflow_name: str | None = None,
+        idempotency_key: str | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> MaterializationInfo:
         """
@@ -51,6 +53,8 @@ class MaterializationJob(abc.ABC):
             materialization.node_revision.type,
             materialization.name,  # type: ignore
             partitions,
+            workflow_name=workflow_name,
+            idempotency_key=idempotency_key,
             request_headers=request_headers,
         )
 

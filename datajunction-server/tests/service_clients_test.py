@@ -1632,3 +1632,141 @@ class TestQueryServiceClient:
                 ],
             )
         assert "Error response from query service" in str(exc_info.value)
+
+    def test_run_backfill_pins_workflow_and_idempotency_key(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """
+        A generation-tracked run sends the pinned workflow name and
+        idempotency key alongside the partition plan.
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "urls": ["http://fake.url/job"],
+            "output_tables": ["default.roads.t"],
+            "workflow_names": ["dj.node.backfill"],
+        }
+        mocked_call = mocker.patch(
+            "datajunction_server.service_clients.RequestsSessionWithEndpoint.post",
+            return_value=mock_response,
+        )
+
+        query_service_client = QueryServiceClient(uri=self.endpoint)
+        response = query_service_client.run_backfill(
+            node_name="default.hard_hat",
+            node_version="v1.0",
+            node_type=NodeType.DIMENSION,
+            materialization_name="default",
+            partitions=[
+                PartitionBackfill(
+                    column_name="birth_date",
+                    range=["20230101", "20230201"],
+                ),
+            ],
+            workflow_name="dj.node.backfill",
+            idempotency_key="bf-1-g1-abc",
+        )
+        assert response.workflow_names == ["dj.node.backfill"]
+        assert mocked_call.call_args.kwargs["json"] == {
+            "partitions": [
+                {
+                    "column_name": "birth_date",
+                    "range": ["20230101", "20230201"],
+                    "values": None,
+                },
+            ],
+            "workflow_name": "dj.node.backfill",
+            "idempotency_key": "bf-1-g1-abc",
+        }
+
+    def test_run_backfill_timeout_requires_workflow_lookup_before_retry(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """
+        A timeout surfaces as an uncertain scheduling result rather than a
+        silent empty answer: the caller must look the original workflow up
+        before resubmitting.
+        """
+        import requests
+
+        from datajunction_server.errors import DJBackfillScheduleUncertainException
+
+        mocker.patch(
+            "datajunction_server.service_clients.RequestsSessionWithEndpoint.post",
+            side_effect=requests.exceptions.Timeout("slow"),
+        )
+        query_service_client = QueryServiceClient(uri=self.endpoint)
+        with pytest.raises(DJBackfillScheduleUncertainException):
+            query_service_client.run_backfill(
+                node_name="default.hard_hat",
+                node_version="v1.0",
+                node_type=NodeType.DIMENSION,
+                materialization_name="default",
+                partitions=[
+                    PartitionBackfill(column_name="birth_date", range=["a", "b"]),
+                ],
+                workflow_name="dj.node.backfill",
+                idempotency_key="bf-1-g1-abc",
+            )
+
+    def test_get_workflow_status_found(self, mocker: MockerFixture) -> None:
+        """A known workflow is returned as a structured status."""
+        from datajunction_server.models.partition import (
+            WorkflowRunState,
+            WorkflowStatusInfo,
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "state": "running",
+            "urls": ["http://fake.url/run"],
+            "completed_partitions": ["birth_date=20230101"],
+        }
+        mocked_call = mocker.patch(
+            "datajunction_server.service_clients.RequestsSessionWithEndpoint.get",
+            return_value=mock_response,
+        )
+
+        query_service_client = QueryServiceClient(uri=self.endpoint)
+        status = query_service_client.get_workflow_status("dj.node.backfill")
+        assert status == WorkflowStatusInfo(
+            workflow_name="dj.node.backfill",
+            state=WorkflowRunState.RUNNING,
+            urls=["http://fake.url/run"],
+            completed_partitions=["birth_date=20230101"],
+        )
+        assert mocked_call.call_args.args[0] == "/workflows/dj.node.backfill"
+
+    def test_get_workflow_status_missing_returns_none(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """A 404 means resubmitting is safe; the answer is None, not an error."""
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mocker.patch(
+            "datajunction_server.service_clients.RequestsSessionWithEndpoint.get",
+            return_value=mock_response,
+        )
+        query_service_client = QueryServiceClient(uri=self.endpoint)
+        assert query_service_client.get_workflow_status("dj.node.backfill") is None
+
+    def test_get_workflow_status_error_raises(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """Any other lookup failure surfaces so reconciliation does not guess."""
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "boom"
+        mocker.patch(
+            "datajunction_server.service_clients.RequestsSessionWithEndpoint.get",
+            return_value=mock_response,
+        )
+        query_service_client = QueryServiceClient(uri=self.endpoint)
+        with pytest.raises(DJQueryServiceClientException):
+            query_service_client.get_workflow_status("dj.node.backfill")
