@@ -2,7 +2,15 @@ from datetime import UTC, datetime
 from functools import partial
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, String
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy_utils import UUIDType
 
@@ -10,7 +18,9 @@ from datajunction_server.database.base import Base
 from datajunction_server.database.user import User
 from datajunction_server.errors import DJError, ErrorCode
 from datajunction_server.models.deployment import (
+    DeploymentProgress,
     DeploymentResult,
+    DeploymentSnapshot,
     NodeCheckResults,
     DeploymentSpec,
     DeploymentStatus,
@@ -46,6 +56,32 @@ class Deployment(Base):
     warnings: Mapped[list | None] = mapped_column(JSON, default=list)
     downstream_impacts: Mapped[list | None] = mapped_column(JSON, default=list)
     check_results: Mapped[list | None] = mapped_column(JSON, default=list)
+
+    # Client-supplied idempotency key (Idempotency-Key header). Nullable;
+    # NULLs never collide, so keyless creates always get a fresh deployment.
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+        unique=True,
+    )
+    # Immutable pin for git deployments to managed namespaces; None for local
+    # deployments, dry-run impact previews, and rows written before pinning.
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # Recoverable per-stage progress (lock/authz/nodes); None for legacy rows.
+    progress: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # Fencing token of the managed-namespace lock this deployment currently
+    # holds (None when it holds no lock).
+    lock_token: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    started_at: Mapped[UTCDatetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
+    finished_at: Mapped[UTCDatetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
 
     created_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     created_by: Mapped[User] = relationship("User", lazy="selectin")
@@ -100,3 +136,30 @@ class Deployment(Base):
     @property
     def deployment_downstream_impacts(self) -> list[DownstreamImpact]:
         return [DownstreamImpact(**item) for item in (self.downstream_impacts or [])]
+
+    @property
+    def deployment_snapshot(self) -> DeploymentSnapshot | None:
+        return DeploymentSnapshot(**self.snapshot) if self.snapshot else None
+
+    @deployment_snapshot.setter
+    def deployment_snapshot(self, value: DeploymentSnapshot | None):
+        self.snapshot = value.model_dump(mode="json") if value else None
+
+    @property
+    def deployment_progress(self) -> DeploymentProgress | None:
+        if not self.progress:
+            return None
+        return DeploymentProgress(**self.progress)
+
+    @deployment_progress.setter
+    def deployment_progress(self, value: DeploymentProgress | None):
+        self.progress = value.model_dump(mode="json") if value else None
+
+    @property
+    def is_pinned(self) -> bool:
+        """Whether this deployment carries the immutable git snapshot."""
+        return bool(self.snapshot)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in DeploymentStatus.terminal()

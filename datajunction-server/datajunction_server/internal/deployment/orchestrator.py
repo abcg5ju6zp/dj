@@ -3,10 +3,10 @@ import logging
 import re
 import time
 from collections import Counter, defaultdict
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from collections.abc import Mapping, Sequence
 from typing import cast
 
 from sqlalchemy import func, or_, select, text
@@ -22,7 +22,7 @@ from datajunction_server.api.helpers import (
     get_node_namespace,
 )
 from datajunction_server.construction.build_v2 import FullColumnName
-from datajunction_server.database import Node, NodeRevision
+from datajunction_server.database import Deployment, Node, NodeRevision
 from datajunction_server.database.attributetype import AttributeType
 from datajunction_server.database.catalog import Catalog
 from datajunction_server.database.column import Column, ColumnAttribute
@@ -51,9 +51,9 @@ from datajunction_server.internal.access.authorization import (
     AccessDenialMode,
 )
 from datajunction_server.internal.access.authorization.context import AuthContext
+from datajunction_server.internal.checks.context import TagTypes
 from datajunction_server.internal.checks.engine import CheckResult
 from datajunction_server.internal.checks.engine import evaluate as evaluate_checks
-from datajunction_server.internal.checks.context import TagTypes
 from datajunction_server.internal.checks.manifest import (
     ManifestChecks,
     to_manifest_checks,
@@ -67,8 +67,8 @@ from datajunction_server.internal.custom_metadata import upsert_schema_specs
 from datajunction_server.internal.deployment.checks import (
     DeclaredSchemas,
     build_bindings,
-    checks_match_last_deployment,
     build_fixtures,
+    checks_match_last_deployment,
     resolve_declared_schemas,
     resolve_tag_types,
     roll_up,
@@ -124,10 +124,12 @@ from datajunction_server.internal.tag_type_claims import (
 from datajunction_server.models.access import ResourceAction
 from datajunction_server.models.base import labelize
 from datajunction_server.models.deployment import (
+    AuthzProgress,
     ChangeTier,
     CheckVerdict,
     ColumnSpec,
     CubeSpec,
+    DeploymentProgress,
     DeploymentResult,
     DeploymentSpec,
     DeploymentStatus,
@@ -266,6 +268,21 @@ def _blocks_by_strategy(
 
 class _DryRunRollback(Exception):
     """Sentinel exception that triggers a SAVEPOINT rollback in dry_run mode."""
+
+
+class DeploymentFencedOrCanceled(Exception):
+    """
+    Raised inside the orchestrator when a progress checkpoint finds that the
+    deployment lost its fencing token (a newer deployment took over the lock)
+    or was cancelled while running. The savepoint rolls back; the executor
+    maps this to the appropriate terminal status without treating it as a
+    normal deployment failure.
+    """
+
+    def __init__(self, reason: str, cancelled: bool = False):
+        super().__init__(reason)
+        self.reason = reason
+        self.cancelled = cancelled
 
 
 class DeploymentTimer:
@@ -410,6 +427,13 @@ class DeploymentOrchestrator:
         session: AsyncSession,
         context: DeploymentContext,
         dry_run: bool = False,
+        initial_progress: DeploymentProgress | None = None,
+        deployment_row: Deployment | None = None,
+        progress_checkpoint: Callable[
+            [DeploymentProgress],
+            Awaitable[str],
+        ]
+        | None = None,
     ):
         # Deployment context
         self.deployment_spec = deployment_spec
@@ -417,6 +441,20 @@ class DeploymentOrchestrator:
         self.session = session
         self.context = context
         self.dry_run = dry_run
+        # Pinned-deployment recovery state (None for dry runs, local deploys,
+        # sync-from-git, and direct orchestrator callers: legacy behavior).
+        self.initial_progress = initial_progress
+        self.deployment_row = deployment_row
+        self.progress_checkpoint = progress_checkpoint
+        # Node names this run intends to apply (post-reconciliation) and the
+        # subset found already at the target revision.
+        self.planned_names: list[str] = []
+        self.reconciled_names: set[str] = set()
+        # In-flight progress accumulator: checkpoint writes happen in separate
+        # transactions, so the deployment_row bound to this (long) session can
+        # be stale; this object is the single in-memory source across
+        # checkpoints and the pre-commit fold.
+        self._progress_accumulator: DeploymentProgress | None = None
 
         # Deployment state tracking
         self.registry = ResourceRegistry()
@@ -524,7 +562,9 @@ class DeploymentOrchestrator:
             pass
         else:
             # `else` only fires when no _DryRunRollback was raised, which
-            # implies wet-run — commit the outer transaction.
+            # implies wet-run — fold confirmed nodes into the progress record
+            # in the SAME transaction, then commit.
+            self._write_progress_precommit()
             await self.session.commit()
             await self._apply_cube_materialization_swaps()
             result.results.extend(self._stop_deleted_node_materializations())
@@ -584,11 +624,19 @@ class DeploymentOrchestrator:
                 )
             self.deployed_results.extend(pre_results)
 
+        # Pinned deployments: drop nodes already at their target revision so a
+        # resume / lost-status-write never applies a confirmed node twice.
+        await self._reconcile_applied_nodes(deployment_plan)
+
         self._guard_against_accidental_wipe(deployment_plan)
 
+        # Record the planned set (and honor a fence/cancel) before any mutation.
+        await self._checkpoint_phase("planned")
+
         # Authorize before any of the plan is applied; a denial raises inside the
-        # SAVEPOINT, so setup-phase writes roll back too.
-        await self._authorize_deployment_plan(deployment_plan)
+        # SAVEPOINT, so setup-phase writes roll back too. A resumed deployment
+        # whose identical plan was already authorized does not re-check.
+        await self._authorize_with_progress(deployment_plan)
 
         with self._timer.phase("governance checks"):
             await self._run_governance_checks(deployment_plan)
@@ -669,6 +717,207 @@ class DeploymentOrchestrator:
             access_checker.add_namespace(namespace, ResourceAction.DELETE)
 
         await access_checker.check(on_denied=AccessDenialMode.RAISE)
+
+    def _accumulated_progress(self) -> DeploymentProgress:
+        """The progress object this run is accumulating into.
+
+        Built once from the initial row state; checkpoint updates land on this
+        object so they survive even though they were committed in a different
+        (short) transaction.
+        """
+        if self._progress_accumulator is not None:
+            return self._progress_accumulator
+        if self.initial_progress is not None:
+            progress = self.initial_progress.model_copy(deep=True)
+        elif self.deployment_row is not None and self.deployment_row.progress:
+            progress = DeploymentProgress(**self.deployment_row.progress)
+        else:
+            progress = DeploymentProgress()
+        self._progress_accumulator = progress
+        return progress
+
+    def _plan_authorization_digest(self, plan: DeploymentPlan) -> str:
+        """
+        Stable digest of exactly what authorization covers: deployed namespaces
+        and node names, deleted nodes and namespaces.
+        """
+        import hashlib
+        import json
+
+        write_namespaces = {self.deployment_spec.namespace}
+        write_namespaces.update(
+            get_namespace_from_name(spec.rendered_name) for spec in plan.to_deploy
+        )
+        payload = {
+            "write_namespaces": sorted(write_namespaces),
+            "deploy_nodes": sorted(spec.rendered_name for spec in plan.to_deploy),
+            "delete_nodes": sorted(spec.rendered_name for spec in plan.to_delete),
+            "delete_namespaces": sorted(plan.to_delete_namespaces),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8"),
+        ).hexdigest()
+
+    async def _reconcile_applied_nodes(self, plan: DeploymentPlan) -> None:
+        """
+        Idempotency barrier for resumed pinned deployments: never create a new
+        revision for a node whose current revision already equals this
+        deployment's target spec, whether or not the progress record claimed
+        it (the status write may have been lost).
+
+        A name the progress record claims as applied but whose live content
+        differs from the immutable snapshot is a corruption signal and aborts
+        the run rather than silently writing a third state.
+        """
+        if self.dry_run or self.deployment_row is None:
+            return
+        prior_applied = set(
+            self.initial_progress.nodes.applied if self.initial_progress else [],
+        )
+        remaining: list[NodeSpec] = []
+        for spec in plan.to_deploy:
+            name = spec.rendered_name
+            existing = plan.existing_specs.get(name)
+            at_target = False
+            if existing is not None:
+                try:
+                    at_target = spec == existing
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Failed comparing recovered spec for %s: %s",
+                        name,
+                        exc,
+                    )
+                    at_target = False
+            if at_target:
+                operation = (
+                    DeploymentResult.Operation.UPDATE
+                    if name in plan.existing_specs
+                    else DeploymentResult.Operation.CREATE
+                )
+                self.deployed_results.append(
+                    DeploymentResult(
+                        name=name,
+                        deploy_type=DeploymentResult.Type.NODE,
+                        status=DeploymentResult.Status.SKIPPED,
+                        operation=operation,
+                        message=(
+                            "already applied (recovered); skipped to avoid a "
+                            "duplicate revision"
+                        ),
+                        change_tier=change_tier_name(ChangeTier.NONE),
+                    ),
+                )
+                self.reconciled_names.add(name)
+                continue
+            if name in prior_applied:
+                raise DJException(
+                    message=(
+                        f"Deployment {self.deployment_id} cannot resume: node "
+                        f"'{name}' is recorded as applied but its live spec "
+                        "differs from the pinned snapshot. Refusing to apply a "
+                        "third state; investigate and redeploy from a fresh "
+                        "commit."
+                    ),
+                )
+            remaining.append(spec)
+        plan.to_deploy = remaining
+        self.planned_names = [spec.rendered_name for spec in remaining]
+        if self.reconciled_names:
+            logger.info(
+                "Reconciled %d node(s) already at the target revision: %s",
+                len(self.reconciled_names),
+                sorted(self.reconciled_names),
+            )
+
+    async def _checkpoint_phase(self, phase: str) -> None:
+        """
+        Persist (in a separate, short transaction) the current progress and
+        confirm this deployment still owns the lock and was not cancelled.
+
+        Never adds names to ``applied`` here: applied claims are committed in
+        the same transaction as the node revisions in ``_write_progress_precommit``.
+        """
+        if self.dry_run or self.progress_checkpoint is None:
+            return
+        progress = self._accumulated_progress()
+        prior_applied = set(progress.nodes.applied)
+        progress.nodes.phase = phase
+        progress.nodes.applied = sorted(prior_applied)
+        progress.nodes.pending_rollback = sorted(
+            set(self.planned_names) - prior_applied,
+        )
+        verdict = await self.progress_checkpoint(progress)
+        if verdict != "ok":
+            raise DeploymentFencedOrCanceled(
+                f"deployment checkpoint verdict: {verdict}",
+                cancelled=verdict == "cancelled",
+            )
+
+    async def _authorize_with_progress(self, plan: DeploymentPlan) -> None:
+        """Authorize once: skip a repeat when resuming with the same plan."""
+        digest = self._plan_authorization_digest(plan)
+        prior = self.initial_progress
+        if (
+            prior is not None
+            and prior.authz is not None
+            and prior.authz.state == "done"
+            and prior.authz.plan_digest == digest
+        ):
+            logger.info(
+                "Skipping authorization for resumed deployment %s: identical "
+                "plan digest already authorized",
+                self.deployment_id,
+            )
+            return
+        await self._authorize_deployment_plan(plan)
+        if self.progress_checkpoint is None or self.dry_run:
+            return
+        progress = self._accumulated_progress()
+        progress.authz = AuthzProgress(state="done", plan_digest=digest)
+        verdict = await self.progress_checkpoint(progress)
+        if verdict != "ok":
+            raise DeploymentFencedOrCanceled(
+                f"deployment checkpoint verdict: {verdict}",
+                cancelled=verdict == "cancelled",
+            )
+
+    def _write_progress_precommit(self) -> None:
+        """
+        Fold this run's confirmed node results into the progress record in the
+        SAME transaction that commits the node revisions, so an applied node is
+        never recorded without its revision and vice versa.
+        """
+        if self.dry_run or self.deployment_row is None:
+            return
+        progress = self._accumulated_progress()
+        confirmed = {
+            result.name
+            for result in self.deployed_results
+            if result.deploy_type == DeploymentResult.Type.NODE
+            and result.operation
+            in (
+                DeploymentResult.Operation.CREATE,
+                DeploymentResult.Operation.UPDATE,
+            )
+            and result.status
+            in (
+                DeploymentResult.Status.SUCCESS,
+                DeploymentResult.Status.INVALID,
+                DeploymentResult.Status.WARNING,
+            )
+        }
+        applied = sorted(
+            set(progress.nodes.applied) | confirmed | self.reconciled_names,
+        )
+        progress.nodes.applied = applied
+        progress.nodes.attempted = sorted(set(self.planned_names))
+        progress.nodes.pending_rollback = sorted(
+            set(self.planned_names) - set(applied),
+        )
+        progress.nodes.phase = "applying"
+        self.deployment_row.progress = progress.model_dump(mode="json")
+        flag_modified(self.deployment_row, "progress")
 
     async def _run_governance_checks(self, plan: DeploymentPlan) -> None:
         """
@@ -945,8 +1194,12 @@ class DeploymentOrchestrator:
     async def _update_deployment_status(self):
         """
         Update deployment status with current results (skipped for dry runs).
+
+        Pinned recoverable deployments persist progress through the fenced
+        checkpoint machinery instead: a mid-flight RUNNING/results write from
+        a separate session would race the same-txn progress fold.
         """
-        if self.dry_run:
+        if self.dry_run or self.deployment_row is not None:
             return
         from datajunction_server.api.deployments import InProcessExecutor
 
@@ -2417,6 +2670,9 @@ class DeploymentOrchestrator:
             self.deployed_results.extend(deployed_results)
             self.registry.add_nodes(deployed_nodes)
             await self._update_deployment_status()
+
+            # Pinned deployments: honor cancellation/fencing between phases.
+            await self._checkpoint_phase("applying")
 
             with timer.phase("deploy links") as p:
                 deployed_links = await self._deploy_links(plan)

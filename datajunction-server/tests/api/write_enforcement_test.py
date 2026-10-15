@@ -130,6 +130,18 @@ CASES = [
         resource=ResourceType.NAMESPACE,
         action=ResourceAction.MANAGE,
     ),
+    # deployment lifecycle actions are governed by WRITE on the target
+    # namespace
+    Case(
+        "POST",
+        "/deployments/{deployment_id}/cancel",
+        resource=ResourceType.NAMESPACE,
+    ),
+    Case(
+        "POST",
+        "/deployments/{deployment_id}/resume",
+        resource=ResourceType.NAMESPACE,
+    ),
     # delete-governed endpoints
     Case("DELETE", "/nodes/{name}", action=ResourceAction.DELETE),
     Case("DELETE", "/nodes/{name}/hard", action=ResourceAction.DELETE),

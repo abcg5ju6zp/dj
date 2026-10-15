@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from collections.abc import Iterable, Sequence
 from enum import Enum, IntEnum
 from typing import Annotated, Any, ClassVar, Literal
@@ -132,6 +133,16 @@ class DeploymentStatus(str, Enum):
     RUNNING = "running"
     FAILED = "failed"
     SUCCESS = "success"
+    # The pinned commit no longer matches the tracked branch's remote HEAD:
+    # the executor refuses to apply a stale snapshot.
+    STALE = "stale"
+    # Cancelled through the cancel endpoint while pending/running.
+    CANCELLED = "cancelled"
+
+    @classmethod
+    def terminal(cls) -> set["DeploymentStatus"]:
+        """Statuses from which a deployment never moves."""
+        return {cls.SUCCESS, cls.FAILED, cls.STALE, cls.CANCELLED}
 
 
 class DeploymentSourceType(str, Enum):
@@ -2041,6 +2052,89 @@ class DeploymentResult(BaseModel):
     revalidation_only: bool | None = None
 
 
+class SnapshotPlannedChange(BaseModel):
+    """
+    One planned mutation recorded by the create-time impact snapshot.
+    """
+
+    name: str
+    operation: str  # DeploymentResult.Operation value
+    deploy_type: str | None = None  # DeploymentResult.Type value
+    change_tier: ChangeTierName | None = None
+
+
+class SnapshotImpact(BaseModel):
+    """
+    Create-time dry-run impact analysis, frozen with the deployment.
+
+    The executor consumes this snapshot rather than re-reading mutable state
+    (a branch that moved between validation and execution).
+    """
+
+    results: list[DeploymentResult] = Field(default_factory=list)
+    downstream_impacts: list[DownstreamImpact] = Field(default_factory=list)
+    check_results: list[NodeCheckResults] = Field(default_factory=list)
+    warnings: list[DJError] = Field(default_factory=list)
+    planned: list[SnapshotPlannedChange] = Field(default_factory=list)
+
+
+class DeploymentSnapshot(BaseModel):
+    """
+    Immutable pin of a git deployment: which repository, branch and exact
+    commit its content came from, a digest of the canonicalized spec, and the
+    impact analysis computed at creation time.
+    """
+
+    repository: str
+    commit_sha: str
+    spec_digest: str
+    branch: str | None = None
+    commit_author_name: str | None = None
+    commit_author_email: str | None = None
+    impact: SnapshotImpact | None = None
+    pinned_at: datetime | None = None
+
+
+class LockProgress(BaseModel):
+    """Recoverable state of the managed-namespace deployment lock."""
+
+    state: str = "held"  # held | released
+    fencing_token: int
+    lease_expires_at: datetime | None = None
+
+
+class AuthzProgress(BaseModel):
+    """Recoverable state of the deployment's authorization check."""
+
+    state: str  # done | skipped
+    plan_digest: str | None = None
+
+
+class NodeProgress(BaseModel):
+    """
+    Recoverable state of node application.
+
+    ``applied`` names are revisions confirmed committed; ``attempted`` are the
+    names this run was applying when it failed; ``pending_rollback`` names were
+    planned but never confirmed. applied and pending_rollback never intersect.
+    """
+
+    phase: str = "pending"  # pending | planned | applying | finalized | failed
+    applied: list[str] = Field(default_factory=list)
+    attempted: list[str] = Field(default_factory=list)
+    pending_rollback: list[str] = Field(default_factory=list)
+
+
+class DeploymentProgress(BaseModel):
+    """
+    Per-stage recoverable progress persisted alongside a pinned deployment.
+    """
+
+    lock: LockProgress | None = None
+    authz: AuthzProgress | None = None
+    nodes: NodeProgress = Field(default_factory=NodeProgress)
+
+
 class DeploymentInfo(BaseModel):
     """
     Information about a deployment
@@ -2057,6 +2151,9 @@ class DeploymentInfo(BaseModel):
     created_at: str | None = None  # ISO datetime
     created_by: str | None = None  # Username
     source: GitDeploymentSource | LocalDeploymentSource | None = None
+    # Present for pinned git deployments; None on local/dry-run/legacy rows.
+    snapshot: DeploymentSnapshot | None = None
+    progress: DeploymentProgress | None = None
 
 
 def eq_or_fallback(a, b, fallback):

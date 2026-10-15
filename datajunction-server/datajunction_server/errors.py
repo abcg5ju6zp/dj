@@ -324,6 +324,26 @@ class DJAlreadyExistsException(DJException):
     http_status_code: int = HTTPStatus.CONFLICT
 
 
+class DJDeploymentConflictException(DJException):
+    """
+    Raised when a deployment cannot acquire the managed-namespace lock because
+    another active deployment holds it.
+    """
+
+    http_status_code: int = HTTPStatus.CONFLICT
+
+    def __init__(
+        self,
+        message: str,
+        owner_deployment_id: str | None = None,
+        lease_expires_at: object | None = None,
+        **kwargs,
+    ):
+        super().__init__(message=message, **kwargs)
+        self.owner_deployment_id = owner_deployment_id
+        self.lease_expires_at = lease_expires_at
+
+
 class DJDoesNotExistException(DJException):
     """
     Exception raised when an entity doesn't exist.

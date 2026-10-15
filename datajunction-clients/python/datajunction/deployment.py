@@ -48,6 +48,16 @@ class DeploymentStatus(str, Enum):
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
+    STALE = "stale"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_DEPLOYMENT_STATUSES = {
+    DeploymentStatus.SUCCESS.value,
+    DeploymentStatus.FAILED.value,
+    DeploymentStatus.STALE.value,
+    DeploymentStatus.CANCELLED.value,
+}
 
 
 class ResultStatus(str, Enum):
@@ -207,7 +217,9 @@ class DeploymentService:
         timeout = time.time() + 300  # 5 minutes
 
         with Status("Deploying...", console=console):
-            while deployment_data.get("status") not in ("failed", "success"):
+            while (
+                deployment_data.get("status") not in TERMINAL_DEPLOYMENT_STATUSES
+            ):
                 time.sleep(1)
                 deployment_data = self.client.check_deployment(deployment_uuid)
 
@@ -248,6 +260,11 @@ class DeploymentService:
             raise DJDeploymentFailure(
                 project_name=deployment_spec.get("namespace", source_path),
                 errors=[r.__dict__ for r in (errors if errors else deployment.results)],
+            )
+        if deployment.status in (DeploymentStatus.STALE, DeploymentStatus.CANCELLED):
+            raise DJDeploymentFailure(
+                project_name=deployment_spec.get("namespace", source_path),
+                errors=[r.__dict__ for r in deployment.results],
             )
         if file_errors:
             if not as_json:

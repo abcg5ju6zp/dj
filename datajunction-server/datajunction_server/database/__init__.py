@@ -8,6 +8,7 @@ __all__ = [
     "CustomMetadataSchema",
     "Database",
     "Deployment",
+    "DeploymentNamespaceLock",
     "DimensionLink",
     "Engine",
     "GroupMember",
@@ -35,6 +36,7 @@ from datajunction_server.database.collection import Collection
 from datajunction_server.database.custom_metadata_schema import CustomMetadataSchema
 from datajunction_server.database.database import Database, Table
 from datajunction_server.database.deployment import Deployment
+from datajunction_server.database.deployment_lock import DeploymentNamespaceLock
 from datajunction_server.database.dimensionlink import DimensionLink
 from datajunction_server.database.engine import Engine
 from datajunction_server.database.group_member import GroupMember

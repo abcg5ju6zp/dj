@@ -6,19 +6,16 @@ Also provides sync-from-git endpoint for DJ-pull model deployments.
 """
 
 import base64
-import io
 import logging
-import tarfile
-import tempfile
 import uuid
 from pathlib import Path
 
-import yaml
 from fastapi import BackgroundTasks, Depends, Request
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from datajunction_server.api.helpers import get_node_namespace
+from datajunction_server.database.deployment import Deployment
 from datajunction_server.database.node import Node
 from datajunction_server.database.user import User
 from datajunction_server.errors import DJDoesNotExistException, DJInvalidInputException
@@ -30,7 +27,9 @@ from datajunction_server.internal.access.authorization import (
 )
 from datajunction_server.internal.caching.cachelib_cache import get_cache
 from datajunction_server.internal.caching.interface import Cache
+from datajunction_server.internal.deployment import locks as deployment_locks
 from datajunction_server.internal.deployment.orchestrator import DeploymentOrchestrator
+from datajunction_server.internal.deployment.snapshot import fetch_git_spec_dict
 from datajunction_server.internal.deployment.utils import DeploymentContext
 from datajunction_server.internal.git import GitHubService
 from datajunction_server.internal.git.github_service import GitHubServiceError
@@ -59,6 +58,7 @@ from datajunction_server.utils import (
     get_query_service_client,
     get_session,
     get_settings,
+    session_context,
 )
 
 _logger = logging.getLogger(__name__)
@@ -174,112 +174,19 @@ async def _fetch_deployment_spec_from_git(
     namespace: str,
 ) -> dict:
     """
-    Download repo archive at ref, extract, and parse YAML files into a DeploymentSpec dict.
-
-    This implements the DJ-pull model: server fetches content directly from GitHub,
-    so user-submitted content is never trusted.
-
-    Args:
-        github: GitHubService instance
-        repo_path: Repository path (e.g., "owner/repo")
-        ref: Git ref (commit SHA or branch name)
-        git_path: Subdirectory within repo for node definitions (optional)
-        namespace: Target namespace for deployment
-
-    Returns:
-        DeploymentSpec-compatible dict with nodes, namespace, etc.
+    Download repo archive at ref, extract, and parse YAML files into a
+    DeploymentSpec dict (DJ-pull model: server-fetched content is the only
+    source of truth). Implementation lives in
+    ``internal.deployment.snapshot.fetch_git_spec_dict`` so the async pinned
+    deployment path and this synchronous endpoint share one parser.
     """
-    _logger.info(
-        "Fetching deployment spec from git: %s @ %s (path: %s)",
-        repo_path,
-        ref[:12] if len(ref) > 12 else ref,
-        git_path or "/",
-    )
-
-    # Download archive at specific ref (works with commit SHAs and branch names)
-    archive_bytes = await github.download_archive(
+    return await fetch_git_spec_dict(
+        github=github,
         repo_path=repo_path,
-        branch=ref,
-        format="tarball",
+        ref=ref,
+        git_path=git_path,
+        namespace=namespace,
     )
-
-    # Extract and parse YAML files
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            tar.extractall(tmpdir)
-
-        # Find extracted directory (GitHub adds prefix like "owner-repo-sha")
-        extracted_dirs = list(Path(tmpdir).iterdir())
-        if not extracted_dirs:
-            raise DJInvalidInputException(
-                message="Failed to extract archive - no directories found",
-            )
-        repo_dir = extracted_dirs[0]
-
-        # Determine files directory
-        if git_path:
-            files_dir = repo_dir / git_path.strip("/")
-        else:
-            files_dir = repo_dir
-
-        if not files_dir.exists():
-            raise DJInvalidInputException(
-                message=f"Path '{git_path}' not found in repository at ref '{ref}'",
-            )
-
-        # Parse all YAML files, routing by type: project config vs hierarchy vs nodes
-        nodes: list[dict] = []
-        hierarchies: list[dict] = []
-        # Tags are declared in the project config file, keyed by name so a
-        # later dj.yaml wins over an earlier one.
-        tags: dict[str, dict] = {}
-        for yaml_file in files_dir.rglob("*.yaml"):
-            if yaml_file.name == "dj.yaml":
-                try:
-                    with open(yaml_file, encoding="utf-8") as f:
-                        project_config = yaml.safe_load(f)
-                except Exception as exc:  # pragma: no cover
-                    _logger.warning(
-                        "Skipping invalid project config %s: %s",
-                        yaml_file,
-                        exc,
-                    )
-                    continue
-                if isinstance(project_config, dict):
-                    for tag in project_config.get("tags") or []:
-                        if isinstance(tag, dict) and tag.get("name"):
-                            tags[tag["name"]] = tag
-                continue
-            try:
-                with open(yaml_file, encoding="utf-8") as f:
-                    spec = yaml.safe_load(f)
-                if not isinstance(spec, dict) or "name" not in spec:
-                    continue
-                if spec.get("type") == "hierarchy" and "node_type" not in spec:
-                    hierarchies.append(spec)
-                    _logger.debug("Loaded hierarchy spec: %s", spec.get("name"))
-                else:
-                    nodes.append(spec)
-                    _logger.debug("Loaded node spec: %s", spec.get("name"))
-            except Exception as e:
-                _logger.warning("Skipping invalid YAML file %s: %s", yaml_file, e)
-                continue
-
-    _logger.info(
-        "Fetched %d node specs, %d hierarchy specs and %d tag specs from git: %s @ %s",
-        len(nodes),
-        len(hierarchies),
-        len(tags),
-        repo_path,
-        ref[:12] if len(ref) > 12 else ref,
-    )
-
-    return {
-        "namespace": namespace,
-        "nodes": nodes,
-        "tags": list(tags.values()),
-        "hierarchies": hierarchies,
-    }
 
 
 @router.post(
@@ -956,11 +863,41 @@ async def sync_namespace_from_git(
         dry_run=False,
     )
 
+    # Take the same managed-namespace lock as async pinned deployments, so a
+    # synchronous pull cannot interleave with one.
+    deployment_uuid = uuid.UUID(deployment_id)
+    async with session_context() as lock_session:
+        lock_session.add(
+            Deployment(
+                uuid=deployment_uuid,
+                namespace=namespace,
+                spec=deployment_spec.model_dump(),
+                status=DeploymentStatus.RUNNING,
+                created_by_id=current_user.id,
+            ),
+        )
+        await lock_session.flush()
+        fencing_token = await deployment_locks.acquire_lock(
+            lock_session,
+            namespace,
+            deployment_uuid,
+        )
+        await lock_session.commit()
+
     try:
         execute_result = await orchestrator.execute()
     except Exception as e:
         _logger.error("Deployment failed for sync-from-git: %s", e)
         raise
+    finally:
+        async with session_context() as lock_session:
+            await deployment_locks.release_lock(
+                lock_session,
+                namespace,
+                deployment_uuid,
+                fencing_token,
+            )
+            await lock_session.commit()
 
     _logger.info(
         "Sync-from-git completed for namespace '%s': %d results",

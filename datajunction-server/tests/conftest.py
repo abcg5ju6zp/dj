@@ -1063,6 +1063,7 @@ def patch_session_contexts(
             "datajunction_server.internal.nodes.session_context",
             "datajunction_server.internal.materializations.session_context",
             "datajunction_server.api.deployments.session_context",
+            "datajunction_server.api.git_sync.session_context",
         ]
         if use_patch
         else []

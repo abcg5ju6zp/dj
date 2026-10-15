@@ -78,10 +78,21 @@ async def lifespan(app: FastAPI):  # pragma: no cover
     # prefer direct session factories and async with
     session_factory = get_session_manager().get_writer_session_factory()
     async with session_factory() as session:
-        await default_attribute_types(session)
-        await seed_default_catalogs(session)
-        await verify_rbac_admins(session, settings)
+            await default_attribute_types(session)
+            await seed_default_catalogs(session)
+            await verify_rbac_admins(session, settings)
 
+    # Resume pinned git deployments interrupted by a process restart. Local
+    # deploys and impact previews keep their previous fire-and-forget
+    # semantics and are not recovered.
+    from datajunction_server.api.deployments import recover_pinned_deployments
+
+    try:
+        recovered = await recover_pinned_deployments()
+        if recovered:
+            _logger.info("Resumed %d pinned deployment(s) after restart", len(recovered))
+    except Exception:  # pragma: no cover - recovery must never block startup
+        _logger.exception("Failed to recover pinned deployments on startup")
     yield
 
 

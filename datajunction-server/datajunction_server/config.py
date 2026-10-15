@@ -334,6 +334,12 @@ class Settings(BaseSettings):  # pragma: no cover
     github_app_private_key: str | None = None  # PEM-encoded private key
     github_app_installation_id: str | None = None
 
+    # Managed-namespace deployment lock: how long a lease stays valid without a
+    # heartbeat (a dead owner can be fenced after this), and how often the
+    # executor renews it.
+    deployment_lock_lease_seconds: int = 60
+    deployment_lock_heartbeat_seconds: int = 15
+
     @property
     def celery(self) -> Celery:
         """

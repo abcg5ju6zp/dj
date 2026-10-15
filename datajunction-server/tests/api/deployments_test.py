@@ -4658,11 +4658,13 @@ class TestDeployments:
                     "changed_fields": [],
                 },
             ],
-            "created_at": None,
-            "created_by": None,
+            "created_at": mock.ANY,
+            "created_by": mock.ANY,
             "warnings": [],
             "downstream_impacts": [],
             "source": None,
+            "snapshot": None,
+            "progress": None,
         }
 
     @pytest.mark.asyncio
@@ -4739,6 +4741,8 @@ class TestDeployments:
             "warnings": [],
             "downstream_impacts": [],
             "source": mock.ANY,
+            "snapshot": None,
+            "progress": None,
         }
 
         # Re-deploying the same setup should be a noop
@@ -5574,6 +5578,8 @@ class TestDeployments:
             "warnings": [],
             "downstream_impacts": [],
             "source": mock.ANY,
+            "snapshot": None,
+            "progress": None,
         }
 
         response = await client.get("/nodes?prefix=base")
@@ -9405,12 +9411,14 @@ class TestGitOnlyNamespaceDeployments:
             columns=[ColumnSpec(name="id", type="int")],
         )
 
-        # Mock GitHubService to return True for verify_commit
+        # Mock GitHubService to return True for verify_commit and keep the
+        # tracked branch on the pinned commit for the executor drift check.
         with patch(
             "datajunction_server.api.deployments.GitHubService",
         ) as mock_github_class:
             mock_github = MagicMock()
             mock_github.verify_commit = AsyncMock(return_value=True)
+            mock_github.resolve_ref_to_sha = AsyncMock(return_value="valid123abc")
             mock_github_class.return_value = mock_github
 
             data = await deploy_and_wait(
