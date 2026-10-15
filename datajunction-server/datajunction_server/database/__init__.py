@@ -17,6 +17,7 @@ __all__ = [
     "NodeNamespace",
     "NodeRevision",
     "NotificationPreference",
+    "OAuthIdentity",
     "Partition",
     "PreAggregation",
     "QueryRequest",
@@ -42,6 +43,7 @@ from datajunction_server.database.measure import Measure
 from datajunction_server.database.namespace import NodeNamespace
 from datajunction_server.database.node import Node, NodeRevision
 from datajunction_server.database.notification_preference import NotificationPreference
+from datajunction_server.database.oauth import OAuthIdentity
 from datajunction_server.database.partition import Partition
 from datajunction_server.database.preaggregation import PreAggregation
 from datajunction_server.database.queryrequest import QueryRequest

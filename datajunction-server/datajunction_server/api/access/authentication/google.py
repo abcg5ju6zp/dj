@@ -3,35 +3,34 @@ Google OAuth Router
 """
 
 import logging
-import secrets
 from datetime import timedelta
 from http import HTTPStatus
 from urllib.parse import urljoin, urlparse
 
 import google.auth.transport.requests
-import google.oauth2.credentials
 import requests
 from fastapi import APIRouter, Depends, Request
 from google.oauth2 import id_token
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 from starlette.responses import RedirectResponse
 
 from datajunction_server.constants import AUTH_COOKIE, LOGGED_IN_FLAG_COOKIE
-from datajunction_server.database.user import User
-from datajunction_server.errors import DJAuthenticationException
-from datajunction_server.internal.access.authentication.basic import get_password_hash
+from datajunction_server.database.user import OAuthProvider
+from datajunction_server.errors import DJAuthenticationException, DJError, ErrorCode
 from datajunction_server.internal.access.authentication.google import (
-    flow,
+    exchange_google_credentials,
     get_authorize_url,
 )
+from datajunction_server.internal.access.authentication.identities import (
+    OAuthProfile,
+    resolve_oauth_principal,
+)
 from datajunction_server.internal.access.authentication.tokens import create_token
-from datajunction_server.models.user import OAuthProvider
 from datajunction_server.utils import Settings, get_session, get_settings
 
 _logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Google OAuth"])
-settings = get_settings()
 
 
 @router.get("/google/login/", status_code=HTTPStatus.FOUND)
@@ -45,63 +44,82 @@ def login(target: str | None = None):
     )
 
 
+def _verify_google_id_token(credentials, audience: str) -> dict:
+    """
+    Verify the provider's OIDC id token synchronously (blocking google-auth call).
+    """
+    request_session = requests.session()
+    token_request = google.auth.transport.requests.Request(session=request_session)
+    return id_token.verify_oauth2_token(
+        id_token=credentials._id_token,
+        request=token_request,
+        audience=audience,
+    )
+
+
 @router.get("/google/token/")
 async def get_access_token(
     request: Request,
     state: str | None = None,
     error: str | None = None,
     session: AsyncSession = Depends(get_session),
-    setting: Settings = Depends(get_settings),
+    settings: Settings = Depends(get_settings),
 ):
     """
-    Perform a token exchange, exchanging a google auth code for a google access token.
-    The google access token is then used to request user information and return a JWT
-    cookie. If the user does not already exist, a new user is created.
+    Perform a token exchange, exchanging a google auth code for a google access
+    token. The verified OIDC id token's immutable ``sub`` claim (not the
+    email/name) determines which local principal is authenticated. Binding
+    lookup/creation and the profile refresh commit as one transaction before
+    the session cookie is issued.
     """
     if error:
         raise DJAuthenticationException(
             f"Ran into an error during Google auth: {error}",
         )
-    if flow is None:
+    if not settings.google_oauth_client_secret_file:
         raise DJAuthenticationException("Google OAuth is not configured")
     hostname = urlparse(settings.url).hostname
     url = str(request.url)
-    flow.fetch_token(authorization_response=url)
-    credentials = flow.credentials
-    request_session = requests.session()
-    token_request = google.auth.transport.requests.Request(session=request_session)
-    user_data = id_token.verify_oauth2_token(
-        id_token=credentials._id_token,
-        request=token_request,
-        audience=setting.google_oauth_client_id,
-    )
+    try:
+        credentials = await run_in_threadpool(exchange_google_credentials, url)
+        user_data = await run_in_threadpool(
+            _verify_google_id_token,
+            credentials,
+            settings.google_oauth_client_id,
+        )
+    except ValueError as exc:
+        raise DJAuthenticationException(
+            http_status_code=HTTPStatus.UNAUTHORIZED,
+            errors=[
+                DJError(
+                    code=ErrorCode.OAUTH_ERROR,
+                    message=f"Invalid Google id token: {exc}",
+                ),
+            ],
+        ) from exc
 
-    existing_user = (
-        await session.execute(
-            select(User).where(User.email == user_data["email"]),
-        )
-    ).scalar()
-    if existing_user:
-        _logger.info("OAuth user found")
-        user = existing_user
-    else:
-        _logger.info("OAuth user does not exist, creating a new user")
-        new_user = User(
-            username=user_data["email"],
-            email=user_data["email"],
-            password=get_password_hash(secrets.token_urlsafe(13)),
-            name=user_data["name"],
-            oauth_provider=OAuthProvider.GOOGLE,
-        )
-        session.add(new_user)
-        await session.commit()
-        await session.refresh(new_user)
-        user = new_user
-    response = RedirectResponse(url=urljoin(settings.frontend_host, state))  # type: ignore
+    profile = OAuthProfile(
+        provider=OAuthProvider.GOOGLE,
+        subject=user_data.get("sub") or "",
+        username=user_data.get("email"),
+        email=user_data.get("email"),
+        name=user_data.get("name"),
+        email_verified=bool(user_data.get("email_verified", False)),
+    )
+    # Resolves and commits atomically; the cookie is only issued afterwards.
+    resolution = await resolve_oauth_principal(session, profile)
+    _logger.info(
+        "Google login resolved as %s for provider subject %s",
+        resolution.status,
+        profile.subject,
+    )
+    response = RedirectResponse(
+        url=urljoin(settings.frontend_host, state or ""),
+    )
     response.set_cookie(
         AUTH_COOKIE,
         create_token(
-            {"username": user.email},
+            {"uid": resolution.user.id, "username": resolution.user.username},
             secret=settings.secret,
             iss=settings.url,
             expires_delta=timedelta(days=365),

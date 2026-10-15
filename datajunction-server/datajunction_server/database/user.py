@@ -51,6 +51,12 @@ class OAuthProvider(StrEnum):
     GOOGLE = "google"
 
 
+# Shared SQLAlchemy Enum type so every column storing ``OAuthProvider``
+# (users.oauth_provider and oauth_identities.provider) maps to the same
+# Postgres enum type instead of trying to create it twice.
+PROVIDER_ENUM = Enum(OAuthProvider, name="oauthprovider")
+
+
 class PrincipalKind(StrEnum):
     """
     Principal kinds: users, service accounts, and groups
@@ -75,7 +81,7 @@ class User(Base):
     email: Mapped[str | None]
     name: Mapped[str | None]
     oauth_provider: Mapped[OAuthProvider] = mapped_column(
-        Enum(OAuthProvider),
+        PROVIDER_ENUM,
     )
     is_admin: Mapped[bool] = mapped_column(default=False)
     kind: Mapped[PrincipalKind] = mapped_column(
@@ -188,6 +194,33 @@ class User(Base):
             ]
         )
         statement = select(User).where(User.username == username).options(*options)
+        result = await session.execute(statement)
+        return result.unique().scalar_one_or_none()
+
+    @classmethod
+    async def get_by_id(
+        cls,
+        session: AsyncSession,
+        user_id: int,
+        options: list[ExecutableOption] | None = None,
+    ) -> User | None:
+        """
+        Find a user by their immutable primary key. This is the authoritative
+        way to resolve an authenticated principal: unlike usernames or emails,
+        the id never changes when an OAuth provider updates profile fields.
+        """
+        options = (
+            options
+            if options is not None
+            else [
+                selectinload(User.created_nodes),
+                selectinload(User.created_collections),
+                selectinload(User.created_tags),
+                selectinload(User.owned_nodes),
+                selectinload(User.notification_preferences),
+            ]
+        )
+        statement = select(User).where(User.id == user_id).options(*options)
         result = await session.execute(statement)
         return result.unique().scalar_one_or_none()
 

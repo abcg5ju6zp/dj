@@ -67,7 +67,10 @@ async def get_short_lived_token(
         status_code=HTTPStatus.OK,
         content={
             "token": create_token(
-                {"username": request.state.user.username},
+                {
+                    "uid": request.state.user.id,
+                    "username": request.state.user.username,
+                },
                 secret=settings.secret,
                 iss=settings.url,
                 expires_delta=expires_delta,

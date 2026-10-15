@@ -49,6 +49,7 @@ class ErrorCode(IntEnum):
     OAUTH_ERROR = 401
     INVALID_LOGIN_CREDENTIALS = 402
     USER_NOT_FOUND = 403
+    OAUTH_IDENTITY_CONFLICT = 404
 
     # Authorization
     UNAUTHORIZED_ACCESS = 500
@@ -390,6 +391,18 @@ class DJAuthenticationException(DJException):
 
     http_status_code: int = HTTPStatus.UNAUTHORIZED
     message: str = "Authentication failed. Please log in and try again."
+
+
+class DJOAuthIdentityConflictException(DJException):
+    """
+    Raised when an OAuth login cannot be bound to a local principal without
+    risking a wrong-account login or a duplicate principal (e.g. the provider
+    profile matches a password account, an account from another provider, or
+    cannot be matched uniquely to a legacy OAuth user). No binding is created
+    and no session is issued; the caller must resolve the conflict out of band.
+    """
+
+    http_status_code: int = HTTPStatus.CONFLICT
 
 
 class DJUninitializedResourceException(DJInternalErrorException):

@@ -3,20 +3,21 @@ GitHub OAuth helper functions
 """
 
 import logging
-import secrets
 from urllib.parse import urljoin
 
-import requests
-from sqlalchemy import select
-from sqlalchemy.exc import NoResultFound
+import httpx
 
-from datajunction_server.database.user import User
-from datajunction_server.errors import DJAuthenticationException
-from datajunction_server.internal.access.authentication.basic import get_password_hash
-from datajunction_server.models.user import OAuthProvider
-from datajunction_server.utils import get_session, get_settings
+from datajunction_server.config import Settings
+from datajunction_server.database.user import OAuthProvider
+from datajunction_server.errors import DJAuthenticationException, DJError, ErrorCode
+from datajunction_server.internal.access.authentication.identities import OAuthProfile
+from datajunction_server.utils import get_settings
 
 _logger = logging.getLogger(__name__)
+
+GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_USER_URL = "https://api.github.com/user"
+REQUEST_TIMEOUT = 10
 
 
 def get_authorize_url(oauth_client_id: str) -> str:
@@ -31,42 +32,86 @@ def get_authorize_url(oauth_client_id: str) -> str:
     )
 
 
-def get_github_user(access_token: str) -> User:  # pragma: no cover
+async def exchange_github_code(
+    code: str,
+    settings: Settings | None = None,
+) -> str:
     """
-    Get the user for a request
+    Exchange an authorization code for a GitHub access token
     """
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
-    user_data = requests.get(
-        "https://api.github.com/user",
-        headers=headers,
-        timeout=10,
-    ).json()
+    settings = settings or get_settings()
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.post(
+            GITHUB_ACCESS_TOKEN_URL,
+            params={
+                "client_id": settings.github_oauth_client_id,
+                "client_secret": settings.github_oauth_client_secret,
+                "code": code,
+            },
+            headers={"Accept": "application/json"},
+        )
+    access_data = response.json()
+    if "error" in access_data:
+        raise DJAuthenticationException(
+            errors=[
+                DJError(
+                    code=ErrorCode.OAUTH_ERROR,
+                    message=(
+                        "Received an error from the GitHub authorization "
+                        f"server: {access_data['error']}"
+                    ),
+                ),
+            ],
+        )
+    access_token = access_data.get("access_token")
+    if not access_token:
+        message = "No user access token retrieved from GitHub OAuth API"
+        _logger.error(message)
+        raise DJAuthenticationException(
+            errors=[DJError(message=message, code=ErrorCode.OAUTH_ERROR)],
+        )
+    return access_token
+
+
+async def fetch_github_profile(access_token: str) -> OAuthProfile:
+    """
+    Fetch the GitHub user's profile and normalize it. The immutable binding
+    key is GitHub's numeric user ``id`` (never reused); ``login``/``email``/
+    ``name`` are mutable display fields.
+    """
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.get(
+            GITHUB_USER_URL,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+    if response.status_code != httpx.codes.OK:
+        raise DJAuthenticationException(
+            errors=[
+                DJError(
+                    code=ErrorCode.OAUTH_ERROR,
+                    message=(
+                        "Could not retrieve user using the GitHub provided "
+                        f"access token ({response.status_code}): {response.text}"
+                    ),
+                ),
+            ],
+        )
+    user_data = response.json()
     if "message" in user_data and user_data["message"] == "Bad credentials":
         raise DJAuthenticationException(
             "Cannot authorize user via GitHub, bad credentials",
         )
-    session = next(get_session())  # type: ignore
-    existing_user = None
-    try:
-        existing_user = session.execute(
-            select(User).where(User.username == user_data["login"]),
-        ).scalar()
-    except NoResultFound:
-        pass
-    if existing_user:
-        _logger.info("OAuth user found")
-        user = existing_user
-    else:
-        _logger.info("OAuth user does not exist, creating a new user")
-        new_user = User(
-            username=user_data["login"],
-            password=get_password_hash(secrets.token_urlsafe(13)),
-            email=user_data["email"],
-            name=user_data["name"],
-            oauth_provider=OAuthProvider.GITHUB,
+    if user_data.get("id") is None or not user_data.get("login"):
+        raise DJAuthenticationException(
+            "GitHub did not return the user id and login",
         )
-        session.add(new_user)
-        session.commit()
-        session.refresh(new_user)
-        user = new_user
-    return user
+    return OAuthProfile(
+        provider=OAuthProvider.GITHUB,
+        subject=str(user_data["id"]),
+        username=user_data["login"],
+        email=user_data.get("email"),
+        name=user_data.get("name"),
+    )

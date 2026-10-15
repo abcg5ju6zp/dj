@@ -15,10 +15,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
 from datajunction_server.constants import AUTH_COOKIE
+from datajunction_server.database.user import User
 from datajunction_server.errors import DJAuthenticationException, DJError, ErrorCode
-from datajunction_server.internal.access.authentication.basic import get_user
+from datajunction_server.internal.access.authentication.basic import (
+    get_user,
+    get_user_by_id,
+)
 from datajunction_server.internal.access.authentication.tokens import decode_token
 from datajunction_server.utils import get_session, get_settings
+
+
+async def resolve_principal(jwt_data: dict, session: AsyncSession) -> User:
+    """
+    Resolve the authenticated principal encoded in a token.
+
+    New tokens carry the immutable ``uid`` (local user id), which is the
+    authoritative anchor: if the provider login/email or the local username
+    changes, the token still resolves to the same principal. Tokens issued
+    before this change only carry ``username`` and keep resolving that way.
+    """
+    if jwt_data.get("uid") is not None:
+        return await get_user_by_id(user_id=jwt_data["uid"], session=session)
+    return await get_user(username=jwt_data["username"], session=session)
 
 
 class DJHTTPBearer(HTTPBearer):
@@ -46,10 +64,7 @@ class DJHTTPBearer(HTTPBearer):
                         ),
                     ],
                 ) from exc
-            request.state.user = await get_user(
-                username=jwt_data["username"],
-                session=session,
-            )
+            request.state.user = await resolve_principal(jwt_data, session)
             return
 
         authorization: str = request.headers.get("Authorization")
@@ -79,10 +94,7 @@ class DJHTTPBearer(HTTPBearer):
                 )
             return  # pragma: no cover
         jwt_data = decode_token(credentials)
-        request.state.user = await get_user(
-            username=jwt_data["username"],
-            session=session,
-        )
+        request.state.user = await resolve_principal(jwt_data, session)
         return
 
 

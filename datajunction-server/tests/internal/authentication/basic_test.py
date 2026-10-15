@@ -29,6 +29,34 @@ async def test_login_with_username_and_password(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_login_cookie_carries_immutable_uid(
+    client: AsyncClient,
+    session: AsyncSession,
+):
+    """
+    Basic login keeps its username/password behavior, but the issued session
+    also carries the immutable user id so profile renames cannot break
+    session resolution.
+    """
+    from datajunction_server.database.user import User
+    from datajunction_server.internal.access.authentication.tokens import decode_token
+
+    await client.post(
+        "/basic/user/",
+        data={"email": "dj2@datajunction.io", "username": "dj2", "password": "dj2"},
+    )
+    response = await client.post(
+        "/basic/login/",
+        data={"username": "dj2", "password": "dj2"},
+    )
+    assert response.status_code in (200, 201)
+    claims = decode_token(response.cookies.get(AUTH_COOKIE))
+    user = await User.get_by_username(session, "dj2", options=[])
+    assert claims["username"] == "dj2"
+    assert claims["uid"] == user.id
+
+
+@pytest.mark.asyncio
 async def test_logout(client: AsyncClient):
     """
     Test validating logging out

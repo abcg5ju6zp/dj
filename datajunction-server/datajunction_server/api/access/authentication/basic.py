@@ -80,7 +80,7 @@ async def login(
     response.set_cookie(
         AUTH_COOKIE,
         create_token(
-            {"username": user.username},
+            {"uid": user.id, "username": user.username},
             secret=settings.secret,
             iss=settings.url,
             expires_delta=timedelta(days=365),
